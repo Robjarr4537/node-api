@@ -1,26 +1,21 @@
 const express = require('express');
-
 const app = express();
-const PORT = process.env.PORT || 3000;
 
-app.get('/', (req, res) => {
-  res.send('API is running. Try /health');
-});
-
+// Health check endpoint
 app.get('/health', (req, res) => {
-  res.json({ ok: true, time: new Date().toISOString() });
+  res.send('OK');
 });
 
-app.get('/posts', async (req, res) => {
-  try {
-    const response = await fetch('https://sheet.best/api/sheets/1Oc2lahvp_C3vo7oadayV5Pv5pyAg-GO0MV5ZrQ-YfOo/posts');
-    const data = await response.json();
-    res.json(data);
-  } catch (error) {
-    res.status(500).json({ error: 'Failed to fetch posts' });
-  }
+// Posts endpoint
+app.get('/posts', (req, res) => {
+  res.json([
+    { id: 1, title: 'First post' },
+    { id: 2, title: 'Second post' }
+  ]);
 });
 
-app.listen(PORT, '0.0.0.0', () => {
+// Use PORT from environment (Render sets this)
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => {
   console.log(`Server running on port ${PORT}`);
 });
