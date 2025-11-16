@@ -1,7 +1,6 @@
 const express = require('express');
 const app = express();
 
-// Parse JSON bodies for POST requests
 app.use(express.json());
 
 // Health check
@@ -15,9 +14,48 @@ app.get('/posts', (req, res) => {
   ]);
 });
 
-// Queue (simple status to verify new route)
+// Queue (simple status)
 app.get('/queue', (req, res) => {
   res.json({ status: 'ready' });
+});
+
+// POST /queue -> forward payload to Sheets.best
+app.post('/queue', async (req, res) => {
+  const url = process.env.SHEETS_BEST_URL;
+  const apiKey = process.env.SHEETS_BEST_API_KEY;
+
+  if (!url) return res.status(500).json({ error: 'Missing SHEETS_BEST_URL' });
+
+  try {
+    const response = await fetch(url, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        ...(apiKey ? { 'X-API-KEY': apiKey } : {})
+      },
+      body: JSON.stringify(req.body || {})
+    });
+
+    const text = await response.text();
+    let data;
+    try {
+      data = JSON.parse(text);
+    } catch {
+      data = { raw: text };
+    }
+
+    if (!response.ok) {
+      return res.status(response.status).json({
+        error: 'Sheets.best error',
+        status: response.status,
+        data
+      });
+    }
+
+    return res.json({ ok: true, data });
+  } catch (err) {
+    return res.status(500).json({ error: 'Failed to queue', details: String(err) });
+  }
 });
 
 const PORT = process.env.PORT || 3000;
