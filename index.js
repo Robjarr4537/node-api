@@ -1,4 +1,5 @@
 const express = require('express');
+const cron = require('node-cron');
 const app = express();
 
 app.use(express.json());
@@ -107,6 +108,31 @@ app.get('/sources', async (req, res) => {
     return res.json({ ok: true, data });
   } catch (err) {
     return res.status(500).json({ error: 'Failed to fetch sources', details: String(err) });
+  }
+});
+
+// Cron job: run every hour to check scheduled posts
+cron.schedule('0 * * * *', async () => {
+  console.log('Cron job running: checking sources');
+
+  try {
+    const url = process.env.SHEETS_BEST_URL;
+    const apiKey = process.env.SHEETS_BEST_API_KEY;
+
+    const response = await fetch(url, {
+      method: 'GET',
+      headers: {
+        ...(apiKey ? { 'X-API-KEY': apiKey } : {})
+      }
+    });
+
+    const data = await response.json();
+    const scheduled = data.filter(row => row.status === 'scheduled');
+    console.log('Scheduled posts:', scheduled);
+
+    // TODO: add logic to publish or forward these rows
+  } catch (err) {
+    console.error('Cron job failed:', err);
   }
 });
 
