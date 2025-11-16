@@ -58,6 +58,58 @@ app.post('/queue', async (req, res) => {
   }
 });
 
+// POST /add -> forward payload to Sheets.best
+app.post('/add', async (req, res) => {
+  const url = process.env.SHEETS_BEST_URL;
+  const apiKey = process.env.SHEETS_BEST_API_KEY;
+
+  if (!url) return res.status(500).json({ error: 'Missing SHEETS_BEST_URL' });
+
+  try {
+    const response = await fetch(url, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        ...(apiKey ? { 'X-API-KEY': apiKey } : {})
+      },
+      body: JSON.stringify(req.body || {})
+    });
+
+    const data = await response.json();
+    if (!response.ok) {
+      return res.status(response.status).json({ error: 'Sheets.best error', status: response.status, data });
+    }
+    return res.json({ ok: true, data });
+  } catch (err) {
+    return res.status(500).json({ error: 'Failed to add', details: String(err) });
+  }
+});
+
+// GET /sources -> fetch all rows from Sheets.best
+app.get('/sources', async (req, res) => {
+  const url = process.env.SHEETS_BEST_URL;
+  const apiKey = process.env.SHEETS_BEST_API_KEY;
+
+  if (!url) return res.status(500).json({ error: 'Missing SHEETS_BEST_URL' });
+
+  try {
+    const response = await fetch(url, {
+      method: 'GET',
+      headers: {
+        ...(apiKey ? { 'X-API-KEY': apiKey } : {})
+      }
+    });
+
+    const data = await response.json();
+    if (!response.ok) {
+      return res.status(response.status).json({ error: 'Sheets.best error', status: response.status, data });
+    }
+    return res.json({ ok: true, data });
+  } catch (err) {
+    return res.status(500).json({ error: 'Failed to fetch sources', details: String(err) });
+  }
+});
+
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
   console.log(`Server running on port ${PORT}`);
