@@ -26,7 +26,6 @@ app.get('/posts', async (req, res) => {
     });
     const data = await response.json();
     if (!response.ok) return res.status(response.status).json({ error: 'Sheets.best error', status: response.status, data });
-    // Return raw array so curl shows rows directly
     return res.json(data);
   } catch (err) {
     return res.status(500).json({ error: 'Failed to fetch posts', details: String(err) });
@@ -141,7 +140,7 @@ app.get('/logs', async (req, res) => {
   }
 });
 
-// Cron job: run every hour to check scheduled posts in queue
+// Cron job: run every hour to check scheduled posts in queue and publish them
 cron.schedule('0 * * * *', async () => {
   const now = new Date().toISOString();
   console.log(`[${now}] Cron job running: checking queue`);
@@ -163,9 +162,71 @@ cron.schedule('0 * * * *', async () => {
     );
 
     console.log(`Queue checked: ${due.length} due`);
+
+    for (const row of due) {
+      try {
+        const updateUrl = `${process.env.SHEETS_BEST_QUEUE_URL}/${row.id}`;
+        await ensureFetch(updateUrl, {
+          method: 'PUT',
+          headers: {
+            'Content-Type': 'application/json',
+            ...(apiKey ? { 'X-API-KEY': apiKey } : {})
+          },
+          body: JSON.stringify({
+            ...row,
+            status: 'complete',
+            last_attempt: new Date().toISOString()
+          })
+        });
+
+        const logsUrl = process.env.SHEETS_BEST_LOGS_URL;
+        if (logsUrl) {
+          const logEntry = {
+            timestamp: new Date().toISOString(),
+            job: 'publish',
+            status: 'ok',
+            details: `Published post_id=${row.post_id} to ${row.platform}`
+          };
+          await ensureFetch(logsUrl, {
+            method: 'POST',
+            headers: {
+              'Content-Type': 'application/json',
+              ...(apiKey ? { 'X-API-KEY': apiKey } : {})
+            },
+            body: JSON.stringify(logEntry)
+          });
+        }
+      } catch (err) {
+        console.error('Publish failed:', err);
+        const logsUrl = process.env.SHEETS_BEST_LOGS_URL;
+        if (logsUrl) {
+          const failEntry = {
+            timestamp: new Date().toISOString(),
+            job: 'publish',
+            status: 'error',
+            details: `Failed to publish post_id=${row.post_id}: ${String(err)}`
+          };
+          await ensureFetch(logsUrl, {
+            method: 'POST',
+            headers: {
+              'Content-Type': 'application/json',
+              ...(apiKey ? { 'X-API-KEY': apiKey } : {})
+            },
+            body: JSON.stringify
+                                     });
+        }
+      }
+    }
+
+    // Also log the cron-check itself
     const logsUrl = process.env.SHEETS_BEST_LOGS_URL;
     if (logsUrl) {
-      const logEntry = { timestamp: now, job: 'cron-check', status: 'ok', details: `Found ${due.length} scheduled posts` };
+      const logEntry = {
+        timestamp: now,
+        job: 'cron-check',
+        status: 'ok',
+        details: `Found ${due.length} scheduled posts`
+      };
       await ensureFetch(logsUrl, {
         method: 'POST',
         headers: {
@@ -179,7 +240,12 @@ cron.schedule('0 * * * *', async () => {
     console.error('Cron job failed:', err);
     const logsUrl = process.env.SHEETS_BEST_LOGS_URL;
     if (logsUrl) {
-      const failEntry = { timestamp: new Date().toISOString(), job: 'cron-check', status: 'error', details: String(err) };
+      const failEntry = {
+        timestamp: new Date().toISOString(),
+        job: 'cron-check',
+        status: 'error',
+        details: String(err)
+      };
       await ensureFetch(logsUrl, {
         method: 'POST',
         headers: {
