@@ -1,371 +1,296 @@
 // index.js
+'use strict';
+
 const express = require('express');
 const cron = require('node-cron');
-const app = express();
 
-// Ensure fetch works on all Node versions
+const app = express();
+app.use(express.json());
+
+// ---- Required Environment Variables ----
+const REQUIRED_ENV = [
+  'SHEETS_BEST_API_KEY',
+  'SHEETS_BEST_URL',           // sources
+  'SHEETS_BEST_POSTS_URL',     // posts
+  'SHEETS_BEST_QUEUE_URL',     // queue
+  'SHEETS_BEST_LOGS_URL',      // logs
+  'SHEETS_BEST_REVENUE_URL'    // revenue
+];
+
+function validateEnv() {
+  const missing = REQUIRED_ENV.filter(k => !process.env[k] || !String(process.env[k]).trim());
+  if (missing.length) {
+    const msg = `Missing required env vars: ${missing.join(', ')}`;
+    console.error(msg);
+    throw new Error(msg);
+  }
+}
+validateEnv();
+
+// ---- Fetch Polyfill ----
 const ensureFetch = global.fetch
   ? global.fetch
   : ((...args) => import('node-fetch').then(({ default: f }) => f(...args)));
 
-app.use(express.json());
+// ---- Utilities ----
+async function jsonFetch(url, options = {}, { retries = 2, timeoutMs = 10000 } = {}) {
+  let lastErr;
+  for (let attempt = 0; attempt <= retries; attempt++) {
+    try {
+      const controller = typeof AbortController !== 'undefined' ? new AbortController() : null;
+      const timer = controller ? setTimeout(() => controller.abort(), timeoutMs) : null;
 
-// Utility: safe JSON fetch
-async function jsonFetch(url, options = {}) {
-  const res = await ensureFetch(url, options);
-  const data = await res.json().catch(() => ({}));
-  if (!res.ok) {
-    const msg = typeof data === 'object' ? JSON.stringify(data) : String(data);
-    throw new Error(`HTTP ${res.status} -> ${msg}`);
+      const res = await ensureFetch(url, {
+        ...options,
+        signal: controller ? controller.signal : undefined
+      });
+
+      if (timer) clearTimeout(timer);
+
+      const text = await res.text();
+      let data;
+      try { data = text ? JSON.parse(text) : {}; } catch { data = text; }
+
+      if (!res.ok) {
+        throw new Error(`HTTP ${res.status} ${res.statusText} -> ${typeof data === 'string' ? data : JSON.stringify(data)}`);
+      }
+      return data;
+    } catch (err) {
+      lastErr = err;
+      if (attempt < retries) await new Promise(r => setTimeout(r, 500 * (attempt + 1)));
+    }
   }
-  return data;
+  throw lastErr;
 }
 
-// Utility: log to logs tab (best-effort)
+function nowISO() { return new Date().toISOString(); }
+function norm(s) { return (s || '').trim().toLowerCase(); }
+
+// ---- Sheet Writers ----
 async function writeLog(entry) {
-  const logsUrl = process.env.SHEETS_BEST_LOGS_URL;
+  const url = process.env.SHEETS_BEST_LOGS_URL;
   const apiKey = process.env.SHEETS_BEST_API_KEY;
-  if (!logsUrl) return;
-  const payload = {
-    timestamp: new Date().toISOString(),
-    ...entry
-  };
+  const payload = { timestamp: nowISO(), ...entry };
   try {
-    await ensureFetch(logsUrl, {
+    await jsonFetch(url, {
       method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        ...(apiKey ? { 'X-API-KEY': apiKey } : {})
-      },
+      headers: { 'Content-Type': 'application/json', 'X-API-KEY': apiKey },
       body: JSON.stringify(payload)
     });
-  } catch (_) {
-    // swallow
-  }
+  } catch (err) { console.error('writeLog failed:', err); }
 }
 
-// Health
-app.get('/health', (req, res) => res.send('OK'));
-
-// Posts
-app.get('/posts', async (req, res) => {
-  const url = process.env.SHEETS_BEST_POSTS_URL;
+async function writeRevenue(entry) {
+  const url = process.env.SHEETS_BEST_REVENUE_URL;
   const apiKey = process.env.SHEETS_BEST_API_KEY;
-  if (!url) return res.status(500).json({ error: 'Missing SHEETS_BEST_POSTS_URL' });
+  const payload = { timestamp: nowISO(), ...entry };
   try {
-    const data = await jsonFetch(url, { headers: { ...(apiKey ? { 'X-API-KEY': apiKey } : {}) } });
-    return res.json(data);
-  } catch (err) {
-    return res.status(500).json({ error: 'Failed to fetch posts', details: String(err) });
-  }
-});
-
-// Queue
-app.get('/queue', async (req, res) => {
-  const url = process.env.SHEETS_BEST_QUEUE_URL;
-  const apiKey = process.env.SHEETS_BEST_API_KEY;
-  if (!url) return res.status(500).json({ error: 'Missing SHEETS_BEST_QUEUE_URL' });
-  try {
-    const data = await jsonFetch(url, { headers: { ...(apiKey ? { 'X-API-KEY': apiKey } : {}) } });
-    return res.json(data);
-  } catch (err) {
-    return res.status(500).json({ error: 'Failed to fetch queue', details: String(err) });
-  }
-});
-
-app.post('/queue', async (req, res) => {
-  const url = process.env.SHEETS_BEST_QUEUE_URL;
-  const apiKey = process.env.SHEETS_BEST_API_KEY;
-  if (!url) return res.status(500).json({ error: 'Missing SHEETS_BEST_QUEUE_URL' });
-  try {
-    const data = await jsonFetch(url, {
+    await jsonFetch(url, {
       method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        ...(apiKey ? { 'X-API-KEY': apiKey } : {})
-      },
-      body: JSON.stringify(req.body || {})
+      headers: { 'Content-Type': 'application/json', 'X-API-KEY': apiKey },
+      body: JSON.stringify(payload)
     });
-    return res.json(data);
-  } catch (err) {
-    return res.status(500).json({ error: 'Failed to add to queue', details: String(err) });
-  }
-});
+  } catch (err) { console.error('writeRevenue failed:', err); }
+}
 
-// Sources
-app.get('/sources', async (req, res) => {
-  const url = process.env.SHEETS_BEST_URL;
-  const apiKey = process.env.SHEETS_BEST_API_KEY;
-  if (!url) return res.status(500).json({ error: 'Missing SHEETS_BEST_URL' });
+async function getSources() {
+  return jsonFetch(process.env.SHEETS_BEST_URL, { headers: { 'X-API-KEY': process.env.SHEETS_BEST_API_KEY } });
+}
+async function getPosts() {
+  return jsonFetch(process.env.SHEETS_BEST_POSTS_URL, { headers: { 'X-API-KEY': process.env.SHEETS_BEST_API_KEY } });
+}
+async function insertPost(row) {
   try {
-    const data = await jsonFetch(url, { headers: { ...(apiKey ? { 'X-API-KEY': apiKey } : {}) } });
-    return res.json({ ok: true, data });
-  } catch (err) {
-    return res.status(500).json({ error: 'Failed to fetch sources', details: String(err) });
-  }
-});
-
-app.post('/add', async (req, res) => {
-  const url = process.env.SHEETS_BEST_URL;
-  const apiKey = process.env.SHEETS_BEST_API_KEY;
-  if (!url) return res.status(500).json({ error: 'Missing SHEETS_BEST_URL' });
-  try {
-    const data = await jsonFetch(url, {
+    return await jsonFetch(process.env.SHEETS_BEST_POSTS_URL, {
       method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        ...(apiKey ? { 'X-API-KEY': apiKey } : {})
-      },
-      body: JSON.stringify(req.body || {})
+      headers: { 'Content-Type': 'application/json', 'X-API-KEY': process.env.SHEETS_BEST_API_KEY },
+      body: JSON.stringify(row)
     });
-    return res.json(data);
-  } catch (err) {
-    return res.status(500).json({ error: 'Failed to add', details: String(err) });
-  }
-});
+  } catch (err) { console.error('insertPost failed:', err); throw err; }
+}
+async function insertQueue(row) {
+  try {
+    return await jsonFetch(process.env.SHEETS_BEST_QUEUE_URL, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'X-API-KEY': process.env.SHEETS_BEST_API_KEY },
+      body: JSON.stringify(row)
+    });
+  } catch (err) { console.error('insertQueue failed:', err); throw err; }
+}
+async function getQueue() {
+  return jsonFetch(process.env.SHEETS_BEST_QUEUE_URL, { headers: { 'X-API-KEY': process.env.SHEETS_BEST_API_KEY } });
+}
+async function updateQueueRow(row) {
+  const base = process.env.SHEETS_BEST_QUEUE_URL;
+  const id = row.id || row.ID || row._id || '';
+  const url = id ? `${base}/${id}` : base;
+  try {
+    return await jsonFetch(url, {
+      method: id ? 'PUT' : 'POST',
+      headers: { 'Content-Type': 'application/json', 'X-API-KEY': process.env.SHEETS_BEST_API_KEY },
+      body: JSON.stringify(row)
+    });
+  } catch (err) { console.error('updateQueueRow failed:', err); throw err; }
+}
 
-// Minimal RSS parser (title + link + pubDate) without extra deps
+// ---- RSS Parser ----
 function parseRSS(xmlText) {
+  if (!xmlText || typeof xmlText !== 'string') return [];
   const items = [];
-  const itemRegex = /<item[\s\S]*?<\/item>/gi;
-  const getTag = (block, tag) => {
-    const m = new RegExp(`<${tag}[^>]*>([\\s\\S]*?)<\\/${tag}>`, 'i').exec(block);
-    return m ? m[1].trim() : '';
+  const itemBlocks = xmlText.match(/<item[\s\S]*?<\/item>/gi) || [];
+  const tag = (block, name) => {
+    const m = new RegExp(`<${name}[^>]*>([\\s\\S]*?)<\\/${name}>`, 'i').exec(block);
+    if (!m) return '';
+    return m[1].replace(/<!
+
+\[CDATA
+
+\[(.*?)\]
+
+\]
+
+>/gs, '$1').replace(/\s+/g, ' ').trim();
   };
-  const blocks = xmlText.match(itemRegex) || [];
-  for (const block of blocks) {
-    items.push({
-      title: getTag(block, 'title'),
-      link: getTag(block, 'link'),
-      pubDate: getTag(block, 'pubDate')
-    });
+  for (const b of itemBlocks) {
+    items.push({ title: tag(b, 'title'), link: tag(b, 'link'), pubDate: tag(b, 'pubDate') });
   }
   return items.filter(i => i.title || i.link);
 }
-
-// Helpers: Sheets I/O
-async function getPosts() {
-  const url = process.env.SHEETS_BEST_POSTS_URL;
-  const apiKey = process.env.SHEETS_BEST_API_KEY;
-  return jsonFetch(url, { headers: { ...(apiKey ? { 'X-API-KEY': apiKey } : {}) } });
-}
-
-async function insertPost(row) {
-  const url = process.env.SHEETS_BEST_POSTS_URL;
-  const apiKey = process.env.SHEETS_BEST_API_KEY;
-  return jsonFetch(url, {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      ...(apiKey ? { 'X-API-KEY': apiKey } : {})
-    },
-    body: JSON.stringify(row)
-  });
-}
-
-async function insertQueue(row) {
-  const url = process.env.SHEETS_BEST_QUEUE_URL;
-  const apiKey = process.env.SHEETS_BEST_API_KEY;
-  return jsonFetch(url, {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      ...(apiKey ? { 'X-API-KEY': apiKey } : {})
-    },
-    body: JSON.stringify(row)
-  });
-}
-
-// Dedup check: avoid re-adding same link/title
 function existsPost(posts, title, link) {
-  const norm = (s) => (s || '').trim().toLowerCase();
-  return posts.some(p => norm(p.title) === norm(title) || norm(p.affilliate_url) === norm(link) || norm(p.media_url) === norm(link));
+  const t = norm(title), l = norm(link);
+  return (Array.isArray(posts) ? posts : []).some(p =>
+    norm(p.title) === t || norm(p.affilliate_url) === l || norm(p.body).includes(link || '')
+  );
 }
 
-// Cron A: hourly source polling -> create posts -> auto-queue
-cron.schedule('5 * * * *', async () => {
-  const apiKey = process.env.SHEETS_BEST_API_KEY;
-  const sourcesUrl = process.env.SHEETS_BEST_URL;
-  if (!sourcesUrl) {
-    await writeLog({ job: 'sources-poll', status: 'error', details: 'Missing SHEETS_BEST_URL' });
-    return;
-  }
+// ---- Anti-abuse caps ----
+const CAPS = { maxItemsPerSource: 5, maxNewPostsTotal: 25, queueLeadMinutes: 30 };
 
+// ---- Cron A ----
+async function runCronA() {
+  console.log(`[${nowISO()}] Cron A fired`);
+  let created = 0, queued = 0;
   try {
-    const sources = await jsonFetch(sourcesUrl, { headers: { ...(apiKey ? { 'X-API-KEY': apiKey } : {}) } });
-    const activeSources = (Array.isArray(sources) ? sources : []).filter(s => String(s.active).toUpperCase() === 'TRUE');
-
+    const sources = await getSources();
+    const active = (Array.isArray(sources) ? sources : []).filter(s => String(s.active).toUpperCase() === 'TRUE');
     const posts = await getPosts();
-    let created = 0, queued = 0;
-
-    for (const src of activeSources) {
-      const type = (src.type || '').toLowerCase();
-      const label = src.label || 'source';
-      const url = src.url_or_key;
-
-      if (!url) continue;
-
-      try {
-        if (type === 'feed') {
-          const rssText = await ensureFetch(url).then(r => r.text());
-          const items = parseRSS(rssText).slice(0, 5); // cap to avoid spam
-          for (const item of items) {
-            if (existsPost(posts, item.title, item.link)) continue;
-            const newPost = {
-              created_at: new Date().toISOString(),
-              source: label,
-              title: item.title || '(untitled)',
-              body: item.link ? `Source: ${item.link}` : '',
-              media_url: '',
-              status: 'draft',
-              platform: 'twitter',
-              affilliate_url: item.link || ''
-            };
-            await insertPost(newPost);
-            posts.push(newPost);
-            created++;
-
-            // Auto-queue in 30 minutes
-            const scheduleAt = new Date(Date.now() + 30 * 60 * 1000).toISOString();
-            await insertQueue({
-              schedule_at: scheduleAt,
-              platform: 'twitter',
-              post_id: '', // sheet will fill id; publish uses row.post_id if present
-              status: 'pending',
-              last_attempt: ''
-            });
-            queued++;
-          }
-        } else if (type === 'api') {
-          const json = await jsonFetch(url);
-          const items = Array.isArray(json) ? json.slice(0, 5) : [];
-          for (const item of items) {
-            const title = item.title || item.name || '(untitled)';
-            const link = item.url || item.link || '';
-            if (existsPost(posts, title, link)) continue;
-            const newPost = {
-              created_at: new Date().toISOString(),
-              source: label,
-              title,
-              body: item.description || '',
-              media_url: item.image || '',
-              status: 'draft',
-              platform: 'twitter',
-              affilliate_url: link
-            };
-            await insertPost(newPost);
-            posts.push(newPost);
-            created++;
-
-            const scheduleAt = new Date(Date.now() + 30 * 60 * 1000).toISOString();
-            await insertQueue({
-              schedule_at: scheduleAt,
-              platform: 'twitter',
-              post_id: '',
-              status: 'pending',
-              last_attempt: ''
-            });
-            queued++;
-          }
-        } else if (type === 'event') {
-          // Treat as a static page: create a single evergreen draft if missing
-          if (!existsPost(posts, label, url)) {
-            const newPost = {
-              created_at: new Date().toISOString(),
-              source: label,
-              title: label,
-              body: `Event page: ${url}`,
-              media_url: '',
-              status: 'draft',
-              platform: 'facebook',
-              affilliate_url: url
-            };
-            await insertPost(newPost);
-            posts.push(newPost);
-            created++;
-          }
-        }
-      } catch (err) {
-        await writeLog({ job: 'sources-poll', status: 'error', details: `Source ${label}: ${String(err)}` });
+    for (const src of active) {
+      if (created >= CAPS.maxNewPostsTotal) break;
+      const type = norm(src.type), label = src.label || 'source', url = src.url_or_key || src.url || '';
+      if (!url || type !== 'feed') continue;
+      const rssText = await ensureFetch(url).then(r => r.text()).catch(err => { console.error(`RSS fetch failed for ${label}:`, err); return ''; });
+      const items = parseRSS(rssText).slice(0, CAPS.maxItemsPerSource);
+      for (const item of items) {
+        if (created >= CAPS.maxNewPostsTotal) break;
+        if (existsPost(posts, item.title, item.link)) continue;
+        const newPost = {
+          created_at: nowISO(),
+          source: label,
+          title: item.title || '(untitled)',
+          body: item.link ? `Source: ${item.link}` : '',
+          media_url: '',
+          status: 'pending',
+          platform: 'twitter',
+          affilliate_url: item.link || ''
+        };
+        try {
+          await insertPost(newPost);
+          posts.push(newPost);
+          created++;
+          const scheduleAt = new Date(Date.now() + CAPS.queueLeadMinutes * 60 * 1000).toISOString();
+          await insertQueue({ schedule_at: scheduleAt, platform: 'twitter', post_id: '', status: 'pending', last_attempt: '' });
+          queued++;
+        } catch (err) { console.error('Post/Queue insert failed:', err); }
       }
     }
-
     await writeLog({ job: 'sources-poll', status: 'ok', details: `Created ${created}, queued ${queued}` });
+    console.log(`[${nowISO()}] Cron A done: Created ${created}, queued ${queued}`);
   } catch (err) {
-    await writeLog({ job: 'sources-poll', status: 'error', details: String(err) });
+    console.error('Cron A failed:', err);
+        await writeLog({ job: 'sources-poll', status: 'error', details: String(err) });
   }
-});
+}
 
-// Cron B: hourly publish due queue items
-cron.schedule('0 * * * *', async () => {
-  const now = new Date().toISOString();
-  console.log(`[${now}] Cron publish: checking queue`);
-
+// ---- Cron B ----
+async function runCronB() {
+  console.log(`[${nowISO()}] Cron B fired: checking queue`);
   try {
-    const url = process.env.SHEETS_BEST_QUEUE_URL;
-    const apiKey = process.env.SHEETS_BEST_API_KEY;
-
-    const response = await ensureFetch(url, {
-      method: 'GET',
-      headers: { ...(apiKey ? { 'X-API-KEY': apiKey } : {}) }
+    const data = await getQueue();
+    const now = new Date();
+    const due = (Array.isArray(data) ? data : []).filter(row => {
+      const st = (row.status || '').toLowerCase();
+      const when = new Date(row.schedule_at);
+      return (st === 'pending' || st === 'scheduled') && when <= now;
     });
 
-    const data = await response.json();
-    const nowDate = new Date();
-
-    const due = (Array.isArray(data) ? data : []).filter(
-      row => (row.status === 'pending' || row.status === 'scheduled') && new Date(row.schedule_at) <= nowDate
-    );
-
-    console.log(`Queue checked: ${due.length} due`);
+    console.log(`[${nowISO()}] Queue due count: ${due.length}`);
 
     for (const row of due) {
       try {
-        // Placeholder "publish": this is where you'd call platform APIs.
-        // For now we mark complete and log.
-        const updateUrl = `${process.env.SHEETS_BEST_QUEUE_URL}/${row.id || ''}`.replace(/\/$/, '');
-        await ensureFetch(updateUrl, {
-          method: 'PUT',
-          headers: {
-            'Content-Type': 'application/json',
-            ...(apiKey ? { 'X-API-KEY': apiKey } : {})
-          },
-          body: JSON.stringify({
-            ...row,
-            status: 'complete',
-            last_attempt: new Date().toISOString()
-          })
-        });
+        // PUBLISH PLACEHOLDER: integrate platform APIs here
+        await updateQueueRow({ ...row, status: 'complete', last_attempt: nowISO() });
 
         await writeLog({
           job: 'publish',
           status: 'ok',
           details: `Published post_id=${row.post_id || '(unknown)'} to ${row.platform || '(unknown)'}`
         });
+
+        await writeRevenue({
+          post_id: row.post_id || '',
+          platform: row.platform || '',
+          affiliate_url: row.affilliate_url || '',
+          clicks: 0,
+          revenue: 0
+        });
       } catch (err) {
+        console.error('Publish flow failed:', err);
         await writeLog({
           job: 'publish',
           status: 'error',
-          details: `Failed to publish post_id=${row.post_id || '(unknown)'}: ${String(err)}`
+          details: `Failed post_id=${row.post_id || '(unknown)'}: ${String(err)}`
         });
       }
     }
 
-    await writeLog({
-      job: 'cron-check',
-      status: 'ok',
-      details: `Found ${due.length} scheduled posts`
-    });
+    await writeLog({ job: 'cron-check', status: 'ok', details: `Found ${due.length} scheduled posts` });
+    console.log(`[${nowISO()}] Cron B done: processed ${due.length}`);
   } catch (err) {
-    console.error('Cron job failed:', err);
-    await writeLog({
-      job: 'cron-check',
-      status: 'error',
-      details: String(err)
-    });
+    console.error('Cron B failed:', err);
+    await writeLog({ job: 'cron-check', status: 'error', details: String(err) });
   }
+}
+
+// ---- Express Endpoints ----
+app.get('/health', (_req, res) => res.send('OK'));
+app.get('/sources', async (_req, res) => {
+  try { res.json({ ok: true, data: await getSources() }); }
+  catch (err) { console.error('/sources failed:', err); res.status(500).json({ error: String(err) }); }
+});
+app.get('/posts', async (_req, res) => {
+  try { res.json(await getPosts()); }
+  catch (err) { console.error('/posts failed:', err); res.status(500).json({ error: String(err) }); }
+});
+app.get('/queue', async (_req, res) => {
+  try { res.json(await getQueue()); }
+  catch (err) { console.error('/queue failed:', err); res.status(500).json({ error: String(err) }); }
 });
 
+// Manual triggers
+app.post('/cron/a', async (_req, res) => {
+  try { await runCronA(); res.json({ ok: true }); }
+  catch (err) { res.status(500).json({ ok: false, error: String(err) }); }
+});
+app.post('/cron/b', async (_req, res) => {
+  try { await runCronB(); res.json({ ok: true }); }
+  catch (err) { res.status(500).json({ ok: false, error: String(err) }); }
+});
+
+// ---- Schedule Cron Jobs ----
+cron.schedule('5 * * * *', runCronA);  // HH:05
+cron.schedule('0 * * * *', runCronB);  // HH:00
+
+// ---- Startup ----
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
   console.log(`Server running on port ${PORT}`);
