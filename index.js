@@ -141,7 +141,8 @@ function parseRSS(xmlText) {
   const tag = (block, name) => {
     const m = new RegExp(`<${name}[^>]*>([\\s\\S]*?)<\\/${name}>`, 'i').exec(block);
     if (!m) return '';
-    return m[1].replace(/<!
+    return m[1]
+      .replace(/<!
 
 \[CDATA
 
