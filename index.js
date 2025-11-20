@@ -144,14 +144,23 @@ function parseRSS(xmlText) {
     return m[1]
       .replace(/<!
 
+const tag = (block, name) => {
+  const m = new RegExp(`<${name}[^>]*>([\\s\\S]*?)<\\/${name}>`, 'i').exec(block);
+  if (!m) return '';
+  return m[1]
+    .replace(/<!
+
 \[CDATA
 
 \[(.*?)\]
 
 \]
 
->/gs, '$1').replace(/\s+/g, ' ').trim();
-  };
+>/gs, '$1')   // ✅ fixed regex
+    .replace(/\s+/g, ' ')
+    .trim();
+};
+
   for (const b of itemBlocks) {
     items.push({ title: tag(b, 'title'), link: tag(b, 'link'), pubDate: tag(b, 'pubDate') });
   }
